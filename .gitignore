@@ -1,0 +1,59 @@
+# Build output
+bin/
+obj/
+*.exe
+*.pdb
+*.mdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.cache
+
+# Visual Studio / MSBuild
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.userprefs
+*.svclog
+*.psess
+*.vsp
+*.vspx
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+ipch/
+
+# Test / coverage
+TestResults/
+*.trx
+*.coverage
+*.coveragedata
+coverage/
+
+# Build logs and temporary files
+*.log
+debug.txt
+*.tmp
+*.bak
+*.swp
+*~
+
+# Local configuration (contains the encrypted SSID password)
+config.xml
+
+# ReSharper / Rider
+_ReSharper*/
+*.DotSettings.user
+.idea/
+
+# Visual Studio Code (keep shared settings if you add them)
+.vscode/
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
