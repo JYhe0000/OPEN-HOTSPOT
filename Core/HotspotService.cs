@@ -72,11 +72,19 @@ namespace OpenHotspot
 
                 log("正在检查无线网卡是否支持承载网络……");
                 string driverOutput;
-                if (!CheckHostedNetworkSupport(out driverOutput))
+                int supported = CheckHostedNetworkSupport(out driverOutput);
+                if (supported == 0)
                 {
-                    return Fail("网卡驱动未报告支持承载网络（Hosted network supported: No）。请更换驱动，或改用网卡厂商的 SoftAP 工具。\r\n\r\n" + driverOutput);
+                    return Fail("网卡驱动不支持承载网络（Hosted network supported: No）。请更换驱动，或改用网卡厂商的 SoftAP 工具。\r\n\r\n" + driverOutput);
                 }
-                log("承载网络支持检查通过。");
+                if (supported < 0)
+                {
+                    log("警告：无法从驱动输出确认承载网络支持状态（可能未检测到无线网卡，或系统码页导致输出无法解析）。将继续尝试启动，若失败请以 netsh 报错为准。\r\n" + driverOutput);
+                }
+                else
+                {
+                    log("承载网络支持检查通过。");
+                }
 
                 List<AdapterInfo> adapters = NetworkInventory.GetAdapters();
                 AdapterInfo wired = NetworkInventory.FindByName(adapters, config.WiredName);
@@ -408,7 +416,8 @@ namespace OpenHotspot
                 log("Internet 连接共享服务：" + ServiceState("SharedAccess"));
 
                 string driverOutput;
-                log("承载网络支持：" + (CheckHostedNetworkSupport(out driverOutput) ? "Yes" : "No"));
+                int supported = CheckHostedNetworkSupport(out driverOutput);
+                log("承载网络支持：" + DescribeSupport(supported));
 
                 ProcessResult hosted = NetshRunner.Run("wlan show hostednetwork");
                 if (!string.IsNullOrEmpty(hosted.Output)) log(hosted.Output.Trim());
@@ -885,13 +894,57 @@ namespace OpenHotspot
             }
         }
 
-        private static bool CheckHostedNetworkSupport(out string output)
+        private static int CheckHostedNetworkSupport(out string output)
         {
             ProcessResult result = NetshRunner.Run("wlan show drivers");
             output = result.Output == null ? "" : result.Output;
-            return Regex.IsMatch(output,
-                @"(?im)(Hosted network supported|支持的承载网络|支援的乘載網路)\s*[:：]\s*(Yes|是)",
-                RegexOptions.IgnoreCase);
+            return ParseHostedNetworkSupport(output);
+        }
+
+        private const int SupportYes = 1;
+        private const int SupportNo = 0;
+        private const int SupportUnknown = -1;
+
+        private static int ParseHostedNetworkSupport(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return SupportUnknown;
+
+            bool anyYes = false;
+            string[] lines = text.Split(new string[] { "\r\n", "\n", "\r" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string raw in lines)
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+
+                bool hosted = Regex.IsMatch(line,
+                    @"(?i)hosted\s*network\s*supported" +
+                    @"|支持.{0,3}承载|支援.{0,3}(承載|裝載|乘載|装载)" +
+                    @"|(承载|承載|裝載|乘載|装载).{0,5}(支持|支援)");
+                if (!hosted) continue;
+
+                Match value = Regex.Match(line, @"[:：]\s*(.+?)\s*$");
+                if (!value.Success) continue;
+                string token = value.Groups[1].Value;
+
+                if (Regex.IsMatch(token, @"(?i)^yes(\W.*)?$") || Regex.IsMatch(token, @"^是(\W.*)?$"))
+                {
+                    anyYes = true;
+                    continue;
+                }
+                if (Regex.IsMatch(token, @"(?i)^no(\W.*)?$") || Regex.IsMatch(token, @"^否(\W.*)?$"))
+                {
+                    return SupportNo;
+                }
+            }
+
+            return anyYes ? SupportYes : SupportUnknown;
+        }
+
+        private static string DescribeSupport(int supported)
+        {
+            if (supported == SupportYes) return "是";
+            if (supported == SupportNo) return "否";
+            return "未知";
         }
 
         private static IcsConnection FindConnection(List<IcsConnection> connections, string name)

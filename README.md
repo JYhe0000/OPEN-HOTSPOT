@@ -92,7 +92,7 @@ OpenHotspot 把上述流程做成了一个窗口：填好参数，点击“启�
 
 1. **检查权限**：确认当前进程具有管理员权限。
 2. **确保服务运行**：检查并启动 `WLAN AutoConfig` 和 `Internet Connection Sharing`；服务被禁用时临时改为手动启动（含依赖服务），并在停止热点或回滚时恢复原启动类型。
-3. **检查驱动能力**：执行 `netsh wlan show drivers`，识别 `Hosted network supported` 是否为 `Yes`。
+3. **检查驱动能力**：执行 `netsh wlan show drivers`，识别 `Hosted network supported` 的取值；明确为 `No` 时终止并提示更换驱动，无法确认时仅告警并继续尝试启动（以 `netsh` 实际报错为准）。
 4. **定位有线连接**：通过 WMI 枚举网卡，校验连接存在、已启用且能读取 IPv4 配置。
 5. **校验或设置静态 IP**：
    - 已一致则直接继续；
@@ -190,7 +190,7 @@ mcs -target:winexe -platform:anycpu -optimize+ \
 
 ## 常见问题
 
-### 提示“网卡驱动未报告支持承载网络”
+### 提示“网卡驱动不支持承载网络”
 
 `netsh wlan show drivers` 中 `Hosted network supported` 为 `No`，说明驱动或网卡不支持承载网络。可尝试：
 
