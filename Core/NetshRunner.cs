@@ -43,7 +43,7 @@ namespace OpenHotspot
                 byte[] errorBytes = null;
                 object gate = new object();
 
-                Thread standardThread = new Thread(delegate
+                ThreadStart standardRead = delegate
                 {
                     try
                     {
@@ -53,10 +53,11 @@ namespace OpenHotspot
                     catch
                     {
                     }
-                });
+                };
+                Thread standardThread = new Thread(standardRead);
                 standardThread.IsBackground = true;
 
-                Thread errorThread = new Thread(delegate
+                ThreadStart errorRead = delegate
                 {
                     try
                     {
@@ -66,7 +67,8 @@ namespace OpenHotspot
                     catch
                     {
                     }
-                });
+                };
+                Thread errorThread = new Thread(errorRead);
                 errorThread.IsBackground = true;
 
                 standardThread.Start();
