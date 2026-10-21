@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Management;
 using System.Reflection;
+using Microsoft.Win32;
 using System.Security.Principal;
 using System.ServiceProcess;
 using System.Text.RegularExpressions;
@@ -43,6 +45,13 @@ namespace OpenHotspot
         private bool _sharingTouched;
         private string _activeWiredName;
         private string _activeHostedName;
+        private readonly List<ServiceStartRecord> _serviceStartRecords = new List<ServiceStartRecord>();
+
+        private sealed class ServiceStartRecord
+        {
+            public string Name;
+            public int StartType;
+        }
 
         public OperationResult Start(AppConfig config, LogHandler log)
         {
@@ -51,6 +60,7 @@ namespace OpenHotspot
             _sharingTouched = false;
             _activeWiredName = "";
             _activeHostedName = "";
+            _serviceStartRecords.Clear();
 
             try
             {
@@ -327,6 +337,8 @@ namespace OpenHotspot
                     }
                 }
 
+                RestoreServiceStartTypes(log);
+
                 _sharingTouched = false;
                 HotspotState state = GetStatus(config);
                 log("热点已停止。");
@@ -334,6 +346,7 @@ namespace OpenHotspot
             }
             catch (Exception ex)
             {
+                RestoreServiceStartTypes(log);
                 return Fail(ErrorMessage(ex));
             }
         }
@@ -459,6 +472,7 @@ namespace OpenHotspot
 
             _sharingTouched = false;
             _ipChanged = false;
+            RestoreServiceStartTypes(log);
         }
 
         private static void ValidateConfig(AppConfig config)
@@ -528,26 +542,329 @@ namespace OpenHotspot
             }
         }
 
-        private static void EnsureService(string name, LogHandler log)
+        private void EnsureService(string name, LogHandler log)
         {
+            if (log == null) log = delegate(string message) { };
+
+            int startType = ReadStartType(name);
+            if (startType < 0)
+            {
+                throw new InvalidOperationException(
+                    "系统未安装服务 " + name + "（" + ServiceTitle(name) + "）。\r\n\r\n" +
+                    "精简版系统或优化脚本可能删除了该服务的组件，导致共享网络功能不可用。\r\n" +
+                    "请使用完整的 Windows 系统镜像，或联系管理员恢复该服务。");
+            }
+
             try
             {
                 using (ServiceController controller = new ServiceController(name))
                 {
                     if (controller.Status == ServiceControllerStatus.Running) return;
+
+                    if (startType == 4)
+                    {
+                        log("服务 " + ServiceTitle(name) + " 处于禁用状态，正在临时改为手动启动……");
+                        EnableServiceStart(name, startType);
+                        log("服务 " + name + " 已临时改为手动启动，停止热点时恢复原设置。");
+                    }
+
                     if (controller.Status != ServiceControllerStatus.StartPending)
                     {
-                        log("正在启动服务 " + name + "……");
-                        controller.Start();
+                        StartWithRecovery(controller, name, log);
                     }
-                    controller.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(15));
+
+                    try
+                    {
+                        controller.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(15));
+                    }
+                    catch (Exception waitError)
+                    {
+                        throw BuildStartFailure(name, waitError);
+                    }
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("服务 " + name + " 无法启动：" + ex.Message, ex);
+            }
+        }
+
+        private void StartWithRecovery(ServiceController controller, string name, LogHandler log)
+        {
+            try
+            {
+                log("正在启动服务 " + name + "……");
+                controller.Start();
+                return;
+            }
+            catch
+            {
+            }
+
+            bool fixedDependencies;
+            try
+            {
+                fixedDependencies = FixDisabledDependencies(name, log);
+            }
+            catch (Exception fixError)
+            {
+                throw BuildStartFailure(name, fixError);
+            }
+
+            Thread.Sleep(500);
+
+            try
+            {
+                if (fixedDependencies)
+                {
+                    log("已临时启用相关依赖服务，正在重试启动 " + name + "……");
+                }
+                else
+                {
+                    log("第 1 次启动失败，正在重试 " + name + "……");
+                }
+                controller.Start();
+            }
+            catch (Exception startError)
+            {
+                throw BuildStartFailure(name, startError);
+            }
+        }
+
+        private bool FixDisabledDependencies(string name, LogHandler log)
+        {
+            List<string> visited = new List<string>();
+            return FixDisabledDependencies(name, visited, log);
+        }
+
+        private bool FixDisabledDependencies(string name, List<string> visited, LogHandler log)
+        {
+            bool changed = false;
+            visited.Add(name);
+            string[] dependencies = ReadDependencies(name);
+            foreach (string dependency in dependencies)
+            {
+                int start = ReadStartType(dependency);
+                if (start == 4)
+                {
+                    log("依赖服务 " + dependency + " 处于禁用状态，正在临时改为手动启动……");
+                    EnableServiceStart(dependency, start);
+                    changed = true;
+                    log("依赖服务 " + dependency + " 已临时改为手动启动。");
+                }
+                if (!visited.Contains(dependency) && FixDisabledDependencies(dependency, visited, log))
+                {
+                    changed = true;
+                }
+            }
+            return changed;
+        }
+
+        private void EnableServiceStart(string name, int originalStart)
+        {
+            bool recorded = false;
+            foreach (ServiceStartRecord record in _serviceStartRecords)
+            {
+                if (string.Equals(record.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    recorded = true;
+                    break;
+                }
+            }
+            if (!recorded)
+            {
+                ServiceStartRecord record = new ServiceStartRecord();
+                record.Name = name;
+                record.StartType = originalStart;
+                _serviceStartRecords.Add(record);
+            }
+            ChangeServiceStart(name, 3);
+        }
+
+        public void RestoreServiceStartTypes(LogHandler log)
+        {
+            if (_serviceStartRecords.Count == 0) return;
+            List<ServiceStartRecord> records = new List<ServiceStartRecord>(_serviceStartRecords);
+            _serviceStartRecords.Clear();
+            foreach (ServiceStartRecord record in records)
+            {
+                try
+                {
+                    if (log != null) log("正在恢复服务 " + record.Name + " 的启动类型……");
+                    ChangeServiceStart(record.Name, record.StartType);
+                    if (log != null) log("服务 " + record.Name + " 的启动类型已恢复。");
+                }
+                catch (Exception ex)
+                {
+                    if (log != null) log("恢复服务 " + record.Name + " 的启动类型失败：" + ex.Message);
+                }
+            }
+        }
+
+        private static void ChangeServiceStart(string name, int startType)
+        {
+            if (ChangeStartModeViaWmi(name, startType)) return;
+
+            try
+            {
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(ServiceKeyPath(name), true))
+                {
+                    if (key == null)
+                    {
+                        throw new InvalidOperationException("服务注册表项不存在。");
+                    }
+                    key.SetValue("Start", startType, RegistryValueKind.DWord);
                 }
             }
             catch (Exception ex)
             {
-                throw new InvalidOperationException(
-                    "服务 " + name + " 无法启动：" + ex.Message + "。请检查该服务是否被禁用。", ex);
+                throw new InvalidOperationException("无法修改服务 " + name + " 的启动类型：" + ex.Message, ex);
             }
+        }
+
+        private static bool ChangeStartModeViaWmi(string name, int startType)
+        {
+            string mode = StartModeName(startType);
+            if (mode == null) return false;
+            try
+            {
+                using (ManagementObject service = FindService(name))
+                {
+                    if (service == null) return false;
+                    ManagementBaseObject inParameters = service.GetMethodParameters("ChangeStartMode");
+                    inParameters["StartMode"] = mode;
+                    ManagementBaseObject outParameters = service.InvokeMethod("ChangeStartMode", inParameters, null);
+                    if (outParameters == null) return false;
+                    return Convert.ToUInt32(outParameters["ReturnValue"]) == 0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static ManagementObject FindService(string name)
+        {
+            using (ManagementObjectSearcher searcher = new ManagementObjectSearcher(
+                "SELECT * FROM Win32_Service WHERE Name = '" + name + "'"))
+            {
+                foreach (ManagementObject item in searcher.Get())
+                {
+                    return item;
+                }
+            }
+            return null;
+        }
+
+        private static string ServiceKeyPath(string name)
+        {
+            return "SYSTEM\\CurrentControlSet\\Services\\" + name;
+        }
+
+        private static string StartModeName(int startType)
+        {
+            switch (startType)
+            {
+                case 0: return "Boot";
+                case 1: return "System";
+                case 2: return "Automatic";
+                case 3: return "Manual";
+                case 4: return "Disabled";
+                default: return null;
+            }
+        }
+
+        private static string DescribeStartType(int startType)
+        {
+            switch (startType)
+            {
+                case 0: return "Boot";
+                case 1: return "System";
+                case 2: return "自动";
+                case 3: return "手动";
+                case 4: return "已禁用";
+                default: return null;
+            }
+        }
+
+        private static int ReadStartType(string name)
+        {
+            using (RegistryKey key = Registry.LocalMachine.OpenSubKey(ServiceKeyPath(name)))
+            {
+                if (key == null) return -1;
+                object value = key.GetValue("Start");
+                try
+                {
+                    return value == null ? 3 : Convert.ToInt32(value);
+                }
+                catch
+                {
+                    return 3;
+                }
+            }
+        }
+
+        private static string[] ReadDependencies(string name)
+        {
+            using (RegistryKey key = Registry.LocalMachine.OpenSubKey(ServiceKeyPath(name)))
+            {
+                if (key == null) return new string[0];
+                string[] values = key.GetValue("DependOnService") as string[];
+                if (values == null) return new string[0];
+                List<string> result = new List<string>();
+                foreach (string value in values)
+                {
+                    if (value == null) continue;
+                    string trimmed = value.Trim();
+                    if (trimmed.Length == 0) continue;
+                    result.Add(trimmed);
+                }
+                return result.ToArray();
+            }
+        }
+
+        private static string DescribeDependencies(string name)
+        {
+            string[] dependencies = ReadDependencies(name);
+            if (dependencies.Length == 0) return "无";
+            List<string> items = new List<string>();
+            foreach (string dependency in dependencies)
+            {
+                if (ReadStartType(dependency) < 0) items.Add(dependency + "（服务不存在）");
+                else items.Add(dependency);
+            }
+            return string.Join("、", items.ToArray());
+        }
+
+        private static string ServiceTitle(string name)
+        {
+            switch (name)
+            {
+                case "SharedAccess": return "Internet Connection Sharing（Internet 连接共享）";
+                case "WLANSVC": return "WLAN AutoConfig（WLAN 自动配置）";
+                default: return name;
+            }
+        }
+
+        private static InvalidOperationException BuildStartFailure(string name, Exception error)
+        {
+            List<string> lines = new List<string>();
+            lines.Add("服务 " + name + "（" + ServiceTitle(name) + "）无法启动：" + ErrorMessage(error));
+            lines.Add("");
+            lines.Add("依赖服务：" + DescribeDependencies(name));
+            lines.Add("");
+            lines.Add("常见原因：");
+            lines.Add("1. 该服务或其依赖服务被组策略、安全软件或系统优化工具禁用，本工具已尝试临时启用仍未成功；");
+            lines.Add("2. 精简版系统删除了服务所需的组件，服务无法加载；");
+            lines.Add("3. 服务的注册表配置损坏。");
+            lines.Add("请以管理员身份打开 services.msc，检查该服务的启动类型、状态和“依赖”选项卡；");
+            lines.Add("也可以使用 sfc /scannow 修复系统组件后重试。");
+            return new InvalidOperationException(string.Join("\r\n", lines.ToArray()), error);
         }
 
         private static string ServiceState(string name)
@@ -556,7 +873,10 @@ namespace OpenHotspot
             {
                 using (ServiceController controller = new ServiceController(name))
                 {
-                    return controller.Status.ToString();
+                    string state = controller.Status.ToString();
+                    string startType = DescribeStartType(ReadStartType(name));
+                    if (startType == null) return state;
+                    return state + "，启动类型 " + startType;
                 }
             }
             catch (Exception ex)
